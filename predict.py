@@ -21,6 +21,14 @@ from nougat.utils.device import move_to_device, default_batch_size
 from nougat.utils.checkpoint import get_checkpoint
 from nougat.postprocessing import markdown_compatible
 import pypdf
+import time
+
+gpu_index = 1
+
+torch.cuda.set_device(gpu_index)
+
+current_device = torch.cuda.current_device()
+print(f"PyTorch is currently using GPU {current_device}")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -125,12 +133,14 @@ def get_args():
 def main():
     args = get_args()
     model = NougatModel.from_pretrained(args.checkpoint)
+    # print("model: ", model)
     model = move_to_device(model, bf16=not args.full_precision, cuda=args.batchsize > 0)
     if args.batchsize <= 0:
         # set batch size to 1. Need to check if there are benefits for CPU conversion for >1
         args.batchsize = 1
     model.eval()
     datasets = []
+    # print("args.pdf: ", args.pdf)
     for pdf in args.pdf:
         if not pdf.exists():
             continue
@@ -142,6 +152,7 @@ def main():
                 )
                 continue
         try:
+
             dataset = LazyDataset(
                 pdf,
                 partial(model.encoder.prepare_input, random_padding=False),
@@ -151,6 +162,7 @@ def main():
             logging.info(f"Could not load file {str(pdf)}.")
             continue
         datasets.append(dataset)
+    # print("datasets: ", datasets)
     if len(datasets) == 0:
         return
     dataloader = torch.utils.data.DataLoader(
@@ -160,13 +172,21 @@ def main():
         collate_fn=LazyDataset.ignore_none_collate,
     )
 
+    # print("dataloader: ", dataloader)
+
     predictions = []
     file_index = 0
     page_num = 0
+
+    start_time = time.time()
+
     for i, (sample, is_last_page) in enumerate(tqdm(dataloader)):
+        print("sample, is_last_page: ", sample, is_last_page)
+    
         model_output = model.inference(
             image_tensors=sample, early_stopping=args.skipping
         )
+        # print("model ouput: ", model_output)
         # check if model output is faulty
         for j, output in enumerate(model_output["predictions"]):
             if page_num == 0:
@@ -201,10 +221,14 @@ def main():
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     out_path.write_text(out, encoding="utf-8")
                 else:
-                    print(out, "\n\n")
+                    print("\n\n")
                 predictions = []
                 page_num = 0
                 file_index += 1
+    end_time = time.time()
+
+    print("time_inference: ", end_time - start_time)
+    
 
 
 if __name__ == "__main__":

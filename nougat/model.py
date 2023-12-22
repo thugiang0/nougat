@@ -32,6 +32,8 @@ from transformers.file_utils import ModelOutput
 from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
 from nougat.postprocessing import postprocess
 from nougat.transforms import train_transform, test_transform
+import onnxruntime
+import onnx
 
 
 class SwinEncoder(nn.Module):
@@ -79,6 +81,9 @@ class SwinEncoder(nn.Module):
             num_classes=0,
         )
 
+
+        print("name path: ", name_or_path)
+
         # weight init with swin
         if not name_or_path:
             swin_state_dict = timm.create_model(
@@ -125,7 +130,9 @@ class SwinEncoder(nn.Module):
 
     @staticmethod
     def crop_margin(img: Image.Image) -> Image.Image:
+      
         data = np.array(img.convert("L"))
+      
         data = data.astype(np.uint8)
         max_val = data.max()
         min_val = data.min()
@@ -248,6 +255,7 @@ class BARTDecoder(nn.Module):
                 "facebook/mbart-large-50"
             ).state_dict()
             new_bart_state_dict = self.model.state_dict()
+      
             for x in new_bart_state_dict:
                 if (
                     x.endswith("embed_positions.weight")
@@ -487,6 +495,76 @@ def subdiv(l, b=10):
         subs.append(l[: i + b])
     return subs
 
+class EncoderONNX:
+    def __init__(self, onnx_model_path):
+        self.session = onnxruntime.InferenceSession(onnx_model_path)
+
+    def run_inference(self, input_tensor):
+        ort_inputs = {'input': input_tensor.cpu().numpy()}
+        ort_outs = self.session.run(None, ort_inputs)
+        return ort_outs
+    
+
+    def crop_margin(img: Image.Image) -> Image.Image:
+        data = np.array(img.convert("L"))
+        data = data.astype(np.uint8)
+        max_val = data.max()
+        min_val = data.min()
+        if max_val == min_val:
+            return img
+        data = (data - min_val) / (max_val - min_val) * 255
+        gray = 255 * (data < 200).astype(np.uint8)
+
+        coords = cv2.findNonZero(gray)  # Find all non-zero points (text)
+        a, b, w, h = cv2.boundingRect(coords)  # Find minimum spanning bounding box
+        return img.crop((a, b, w + a, h + b))
+
+    def prepare_input(
+        self, img: Image.Image, random_padding: bool = False
+    ) -> torch.Tensor:
+        """
+        Convert PIL Image to tensor according to specified input_size after following steps below:
+            - resize
+            - rotate (if align_long_axis is True and image is not aligned longer axis with canvas)
+            - pad
+        """
+        if img is None:
+            return
+        # crop margins
+        print("img: ", img)
+        print("img.convert", img.convert("RGB"))
+        try:
+            img = self.crop_margin(img.convert("RGB"))
+        except OSError:
+            # might throw an error for broken files
+            return
+        if img.height == 0 or img.width == 0:
+            return
+        if self.align_long_axis and (
+            (self.input_size[0] > self.input_size[1] and img.width > img.height)
+            or (self.input_size[0] < self.input_size[1] and img.width < img.height)
+        ):
+            img = rotate(img, angle=-90, expand=True)
+        img = resize(img, min(self.input_size))
+        img.thumbnail((self.input_size[1], self.input_size[0]))
+        delta_width = self.input_size[1] - img.width
+        delta_height = self.input_size[0] - img.height
+        if random_padding:
+            pad_width = np.random.randint(low=0, high=delta_width + 1)
+            pad_height = np.random.randint(low=0, high=delta_height + 1)
+        else:
+            pad_width = delta_width // 2
+            pad_height = delta_height // 2
+        padding = (
+            pad_width,
+            pad_height,
+            delta_width - pad_width,
+            delta_height - pad_height,
+        )
+
+        return self.to_tensor(ImageOps.expand(img, padding))
+    
+
 
 class NougatModel(PreTrainedModel):
     r"""
@@ -501,16 +579,23 @@ class NougatModel(PreTrainedModel):
     def __init__(self, config: NougatConfig):
         super().__init__(config)
         self.config = config
-        self.encoder = SwinEncoder(
-            input_size=self.config.input_size,
-            align_long_axis=self.config.align_long_axis,
-            window_size=self.config.window_size,
-            encoder_layer=self.config.encoder_layer,
-            name_or_path=self.config.name_or_path,
-            patch_size=self.config.patch_size,
-            embed_dim=self.config.embed_dim,
-            num_heads=self.config.num_heads,
-        )
+        # self.encoder = SwinEncoder(
+        #     input_size=self.config.input_size,
+        #     align_long_axis=self.config.align_long_axis,
+        #     window_size=self.config.window_size,
+        #     encoder_layer=self.config.encoder_layer,
+        #     name_or_path=self.config.name_or_path,
+        #     patch_size=self.config.patch_size,
+        #     embed_dim=self.config.embed_dim,
+        #     num_heads=self.config.num_heads,
+        # )
+
+        # self.encoder = onnx.load("swin_encoder.onnx")
+
+        
+
+        self.encoder = EncoderONNX("swin_encoder.onnx")
+
         self.decoder = BARTDecoder(
             max_position_embeddings=self.config.max_position_embeddings,
             decoder_layer=self.config.decoder_layer,
@@ -565,6 +650,11 @@ class NougatModel(PreTrainedModel):
             "repeats": list(),
             "repetitions": list(),
         }
+
+        print("output: ", output)
+        print("image: ", image)
+        print("image_tensor: ", image_tensors)
+        
         if image is None and image_tensors is None:
             logging.warn("Image not found")
             return output
@@ -575,13 +665,26 @@ class NougatModel(PreTrainedModel):
         if self.device.type != "mps":
             image_tensors = image_tensors.to(next(self.parameters()).dtype)
 
+        
         image_tensors = image_tensors.to(self.device)
+        
 
-        last_hidden_state = self.encoder(image_tensors)
+        # last_hidden_state = self.encoder(image_tensors)
+
+        # ort_inputs = {'input': image_tensors.cpu().numpy()}
+        # last_hidden_state = self.encoder.run(None, ort_inputs)
+
+        last_hidden_state = self.encoder.run_inference(image_tensors)
+
+        print("image_tensor: ", image_tensors.shape)
+
+        print("last_hidden_state", last_hidden_state)
 
         encoder_outputs = ModelOutput(
             last_hidden_state=last_hidden_state, attentions=None
         )
+
+        print("encoder_outputs: ", encoder_outputs)
 
         if len(encoder_outputs.last_hidden_state.size()) == 1:
             encoder_outputs.last_hidden_state = (
@@ -700,3 +803,9 @@ class NougatModel(PreTrainedModel):
             model.config.max_position_embeddings = max_length
 
         return model
+
+
+
+
+
+
